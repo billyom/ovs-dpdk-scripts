@@ -139,6 +139,21 @@ def is_dpdk_repo(dir_path):
 
     return True
 
+def ensure_env_file_exists():
+    env_ = os.getcwd() + "/" + ENV_FILE_NAME
+    if not os.path.isfile(env_):
+        save_env()
+
+def save_env():
+    """TODO replace the various repeated code chunks with a call to this fn"""
+    env_ = os.getcwd() + "/" + ENV_FILE_NAME
+    env_fp = open(env_, 'w')
+    for key, value in ENV_DICT.iteritems():
+        if value.find(" ") >= 0:
+            value = '"%s"' % value
+        env_fp.write("export %s=%s\n" % (str(key), str(value)))
+    env_fp.close()
+
 def read_and_display_env():
     env_ = os.getcwd() + "/" + ENV_FILE_NAME
     if not os.path.isfile(env_):
@@ -330,6 +345,7 @@ def main():
     if not is_ovs_repo(os.getcwd()):
         print_color_string("Not a valid repo", color = 'red')
         return False
+    ensure_env_file_exists()
     try:
         list_and_run()
     except (KeyboardInterrupt, EOFError), ex:

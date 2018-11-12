@@ -110,11 +110,11 @@ def is_ovs_repo(dir_path):
         print_color_string("The directory path is wrong", color='red')
         return False
 
-    file1 = dir_path + "/Documentation/howto/dpdk.rst"
-    file2 = dir_path + "/Documentation/intro/what-is-ovs.rst"
+    file1 = dir_path + "/ovsdb"
+    file2 = dir_path + "/vswitchd"
 
-    if not (os.path.isfile(file1) and os.path.isfile(file2)):
-        print_color_string("Not in OVS repo, INSTALL files missing",
+    if not (os.path.isdir(file1) and os.path.isdir(file2)):
+        print_color_string("Need to run from top of OVS repo.",
                            color = 'red')
         return False
 
@@ -332,7 +332,7 @@ def main():
         return False
     try:
         list_and_run()
-    except KeyboardInterrupt, ex:
+    except (KeyboardInterrupt, EOFError), ex:
         print "\nBye!"
 
 main()

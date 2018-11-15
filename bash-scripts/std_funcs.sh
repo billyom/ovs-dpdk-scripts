@@ -6,6 +6,7 @@
 # Globals that various std functions will populate
 declare DPDK_IGB_UIO
 declare DPDK_BIND_TOOL
+declare STD_OVS_VER
 declare -A STD_IFACE_TO_PORT # map "iface_name" -> openflow port no
 
 # Create STD_WHITELIST and STD_PCIS from comma/space separated string DPDK_PCIS
@@ -17,13 +18,17 @@ for nic in ${NICS[@]}; do STD_WHITELIST="$STD_WHITELIST -w $nic"; done
 
 # Some settings that don't change often enough to warrant being in the env file
 declare DPDK_SOCKET_MEM="1024,1024"
-declare DPDK_LCORE_MASK="0x1"
+declare DPDK_LCORE_MASK="0x2"
 declare VHU_SOCK_DIR=/tmp
 declare HUGE_DIR=/dev/hugepages
 
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
 # Load the ovs schema and start ovsdb.
-std_start_db() {
-    sudo rm /usr/local/etc/openvswitch/conf.db
+function std_start_db() {
+    echo "Starting ovsdb.."
+    sudo rm -f /usr/local/etc/openvswitch/conf.db
     sudo $OVS_DIR/ovsdb/ovsdb-tool \
         create /usr/local/etc/openvswitch/conf.db \
         $OVS_DIR/vswitchd/vswitch.ovsschema
@@ -34,6 +39,7 @@ std_start_db() {
 }
 
 function std_stop_db() {
+    echo "Stopping ovsdb-server.."
     sudo $OVS_DIR/utilities/ovs-appctl --timeout=3 -t ovsdb-server exit 2> /dev/null
     sleep 1
     sudo pkill -9 ovsdb-server
@@ -47,33 +53,30 @@ function std_start_ovs() {
     sudo $OVS_DIR/utilities/ovs-vsctl --no-wait set Open_vSwitch . other_config:dpdk-socket-mem=$DPDK_SOCKET_MEM
     sudo $OVS_DIR/utilities/ovs-vsctl --no-wait set Open_vSwitch . other_config:dpdk-hugepage-dir="$HUGE_DIR"
     sudo $OVS_DIR/utilities/ovs-vsctl --no-wait set Open_vSwitch . other_config:pmd-cpu-mask="$PMD_CPU_MASK"
-    sudo $OVS_DIR/utilities/ovs-vsctl --no-wait set Open_vSwitch . other_config:emc-insert-inv-prob=100          #x => insert 1 per x times, 1 => always. Special 0 => never.
+    # emc-insert-inv-prop=x => insert avg. of once every x times. 1 => always. Special 0 => never.
+    sudo $OVS_DIR/utilities/ovs-vsctl --no-wait set Open_vSwitch . other_config:emc-insert-inv-prob=1
     sudo $OVS_DIR/utilities/ovs-vsctl --no-wait set Open_vSwitch . other_config:dpdk-extra="$STD_WHITELIST --file-prefix=ovs_"
-
-    #Extract version from ovs-vswitchd -V
-    IFS=" " read -r -a FIELDS <<< $(sudo -E $OVS_DIR/vswitchd/ovs-vswitchd -V | head -1)
-    ovs_ver=${FIELDS[-1]}
 
     echo "Starting OvS.."
     sudo -E $OVS_DIR/vswitchd/ovs-vswitchd --pidfile unix:/usr/local/var/run/openvswitch/db.sock --log-file -vconsole:err -vsyslog:info -vfile:dbg &
 
     echo "Waiting for 'up' line in ovs-vswitchd.log..."
-    case $ovs_ver in
+    case $STD_OVS_VER in
     *2\.10*)
-        sleep 1
-        ( sudo tail -f -n0 /usr/local/var/log/openvswitch/ovs-vswitchd.log & ) | grep -q "bridge.INFO.ovs-vswitchd.*Open vSwitch"
+        ( sudo tail -f -n +0 /usr/local/var/log/openvswitch/ovs-vswitchd.log & ) | grep -q "bridge.INFO.ovs-vswitchd.*Open vSwitch"
     ;;
     *)
-        ( sudo tail -f -n0 /usr/local/var/log/openvswitch/ovs-vswitchd.log & ) | grep -q "memory.*INFO.*handlers.*ports.*revalidator"
+        ( sudo tail -f -n +0 /usr/local/var/log/openvswitch/ovs-vswitchd.log & ) | grep -q "memory.*INFO.*handlers.*ports.*revalidator"
     ;;
     esac
 
-    sudo $OVS_DIR/utilities/ovs-vsctl --timeout 10 del-br br0
+    sudo $OVS_DIR/utilities/ovs-vsctl --timeout 10 --if-exists del-br br0
     sudo $OVS_DIR/utilities/ovs-vsctl --timeout 10 add-br br0 -- set bridge br0 datapath_type=netdev
     echo "OvS is up."
 }
 
 function std_stop_ovs() {
+    echo "Stopping ovs-vswitchd.."
     sudo $OVS_DIR/utilities/ovs-appctl --timeout=3 -t ovs-vswitchd exit 2> /dev/null
     sleep 1
     sudo rm -rf /usr/local/var/log/openvswitch/*
@@ -85,33 +88,48 @@ function std_stop_ovs() {
 }
 
 function std_umount() {
+    echo "Unmounting hugepages.."
     sudo umount $HUGE_DIR
 }
 
 function std_mount() {
-    std_umount
+    echo "Mounting hugepages.."
     mkdir -p $HUGE_DIR
     sudo mount -t hugetlbfs nodev $HUGE_DIR
+    if [[ $(mount | grep hugetlbfs | wc -l) > 1 ]]; then
+        echo -e "${RED}WARNING - several hugepage mounts. Are you sure?${NC}"
+        mount | grep hugetlbfs
+    fi
+
 }
 
 function std_bind_kernel() {
+    echo "Binding $DPDK_PCI1 $DPDK_PCI2 $DPDK_PCI3 $DPDK_PCI4 to $KERNEL_NIC_DRV"
     sudo $DPDK_DIR/tools/dpdk-devbind.py --unbind $DPDK_PCI1 $DPDK_PCI2 $DPDK_PCI3 $DPDK_PCI4
     sudo modprobe $KERNEL_NIC_DRV
     sudo $DPDK_BIND_TOOL --bind=$KERNEL_NIC_DRV $DPDK_PCI1 $DPDK_PCI2
 }
 
 function std_stop_vms() {
+    echo "Killing all qemu's.."
     sudo pkill qemu
 }
 
 function std_clean {
+    # std_stop plus re-init items that generally should not be required to be
+    # re-init'd between vswitchd runs - e.g. re-mount HPs
+    std_stop
+    std_umount
+    std_mount
+    # TODO - rebind drivers, reload gbs
+}
+
+function std_stop {
+    # Stop processes typically started by a test
     std_stop_vms
     std_stop_ovs
     std_stop_db
-    std_umount
 }
-
-
 
 # creates a dpdk interface for each pci device in STD_PCIS array and a number of
 # vhuclient ifaces based on $1 arg.
@@ -125,6 +143,7 @@ function std_clean {
 function std_create_ifaces() {
     VHOST_IFACE_NAME_BASE=vhu_
     DPDK_IFACE_NAME_BASE=dpdk_
+    NUM_VHOST_IFACES=$1
     port_no=1
     #declare -A STD_IFACE_TO_PORT # map "iface_name" -> openflow port no
 
@@ -132,10 +151,10 @@ function std_create_ifaces() {
     do
         IFACE_NAME="${DPDK_IFACE_NAME_BASE}${idx}"
         sudo $OVS_DIR/utilities/ovs-vsctl --timeout 10  add-port br0 $IFACE_NAME \
-		    -- set Interface $IFACE_NAME type=dpdk \
-            options:dpdk-devargs=${STD_PCIS[$idx]}     \
+            -- set Interface $IFACE_NAME type=dpdk \
+            options:dpdk-devargs=${STD_PCIS[$idx]} \
             options:n_rxq=1                        \
-			ofport_request=$port_no
+            ofport_request=$port_no
         STD_IFACE_TO_PORT[$IFACE_NAME]=$port_no
         port_no=$[$port_no+1]
     done
@@ -148,12 +167,11 @@ function std_create_ifaces() {
         sudo $OVS_DIR/utilities/ovs-vsctl --timeout 10 add-port br0 $IFACE_NAME \
           -- set Interface $IFACE_NAME type=dpdkvhostuserclient   \
             options:vhost-server-path="${VHU_SOCK_DIR}/${IFACE_NAME}" \
-			ofport_request=$port_no
+            ofport_request=$port_no
         STD_IFACE_TO_PORT[$IFACE_NAME]=$port_no
         port_no=$[$port_no+1]
     done
 }
-
 
 function std_start_vm() {
     # $1 the number of the vm to start. This is used as an index to determine
@@ -192,7 +210,7 @@ function std_start_vm() {
 ####################################
 
 #Set environment specific for DPDK version
-set_dpdk_env() {
+function set_dpdk_env() {
     DPDK_IGB_UIO=$(find $DPDK_DIR -name igb_uio.ko | head -1 )
     DPDK_BIND_TOOL=$(find $DPDK_DIR -name dpdk-devbind.py | head -1 )
     if [ -z $DPDK_BIND_TOOL ]; then
@@ -202,5 +220,18 @@ set_dpdk_env() {
     echo "Found igb_uio: " $DPDK_IGB_UIO
     echo "Found dpdk bind: " $DPDK_BIND_TOOL
     $DPDK_BIND_TOOL --status-dev net
+
+    # Extract version from ovs-vswitchd -V
+    IFS=" " read -r -a FIELDS <<< $(sudo -E $OVS_DIR/vswitchd/ovs-vswitchd -V | head -1)
+    STD_OVS_VER=${FIELDS[-1]}
+    echo "Found OVS_VER: " $STD_OVS_VER
+
 }
 
+####################################
+#  Utility Functions               #
+####################################
+
+function std_anykey {
+    read -n 1 -s -r -p "Press any key to continue"
+}
